@@ -51,3 +51,30 @@ def render_scene(payload: dict):
         media_type="video/mp4",
         filename=output_file
     )
+
+@app.post("/concat")
+def concat_videos(payload: dict):
+    try:
+        videos = payload["videos"]  # list of public URLs
+    except KeyError:
+        raise HTTPException(status_code=400, detail="Missing videos list")
+
+    with open("list.txt", "w") as f:
+        for url in videos:
+            f.write(f"file '{url}'\n")
+
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "list.txt",
+        "-c", "copy",
+        "final.mp4"
+    ], check=True)
+
+    return FileResponse(
+        "final.mp4",
+        media_type="video/mp4",
+        filename="final.mp4"
+    )
+
