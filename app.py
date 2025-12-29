@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 import subprocess
 import requests
+import os
 
 app = FastAPI()
 
@@ -18,12 +20,18 @@ def render_scene(payload: dict):
     output_file = f"{scene}.mp4"
 
     # Download image
+    r = requests.get(image_url, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(400, "Failed to download image")
     with open(image_file, "wb") as f:
-        f.write(requests.get(image_url).content)
+        f.write(r.content)
 
     # Download audio
+    r = requests.get(audio_url, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(400, "Failed to download audio")
     with open(audio_file, "wb") as f:
-        f.write(requests.get(audio_url).content)
+        f.write(r.content)
 
     # Render video
     subprocess.run([
@@ -32,15 +40,14 @@ def render_scene(payload: dict):
         "-i", audio_file,
         "-c:v", "libx264",
         "-tune", "stillimage",
-        "-c:a", "aac",
-        "-b:a", "192k",
         "-pix_fmt", "yuv420p",
         "-shortest",
         output_file
     ], check=True)
 
-    return {
-        "status": "ok",
-        "scene": scene,
-        "output": output_file
-    }
+    # 🚨 THIS IS THE IMPORTANT LINE 🚨
+    return FileResponse(
+        path=output_file,
+        media_type="video/mp4",
+        filename=output_file
+    )
