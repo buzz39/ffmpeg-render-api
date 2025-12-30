@@ -7,36 +7,12 @@ import uuid
 import shutil
 
 def download_video(url: str, output_path: str):
-    session = requests.Session()
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    response = session.get(url, headers=headers, stream=True)
-
-    # Handle Google Drive confirmation
-    if "confirm=" in response.text:
-        import re
-        confirm_token = re.search(r"confirm=([0-9A-Za-z_]+)", response.text)
-        if confirm_token:
-            confirm = confirm_token.group(1)
-            response = session.get(
-                f"{url}&confirm={confirm}",
-                headers=headers,
-                stream=True,
-            )
-
-    response.raise_for_status()
-
-    with open(output_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
 app = FastAPI()
 
@@ -97,6 +73,7 @@ def concat_videos(payload: dict):
 
     try:
         local_files = []
+
         for i, url in enumerate(videos):
             path = f"{workdir}/scene_{i}.mp4"
             download_video(url, path)
@@ -135,5 +112,3 @@ def concat_videos(payload: dict):
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-
-
