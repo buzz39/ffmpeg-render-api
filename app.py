@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 import subprocess
 import requests
@@ -63,7 +63,7 @@ def render_scene(payload: dict):
     )
 
 @app.post("/concat")
-def concat_videos(payload: dict):
+def concat_videos(payload: dict, background_tasks: BackgroundTasks):
     videos = payload["videos"]
     output_name = payload.get("output_name", "final.mp4")
 
@@ -71,44 +71,43 @@ def concat_videos(payload: dict):
     workdir = f"/tmp/{job_id}"
     os.makedirs(workdir, exist_ok=True)
 
-    try:
-        local_files = []
+    local_files = []
 
-        for i, url in enumerate(videos):
-            path = f"{workdir}/scene_{i}.mp4"
-            download_video(url, path)
-            local_files.append(path)
+    for i, url in enumerate(videos):
+        path = f"{workdir}/scene_{i}.mp4"
+        download_video(url, path)
+        local_files.append(path)
 
-        list_file = f"{workdir}/list.txt"
-        with open(list_file, "w") as f:
-            for p in local_files:
-                f.write(f"file '{p}'\n")
+    list_file = f"{workdir}/list.txt"
+    with open(list_file, "w") as f:
+        for p in local_files:
+            f.write(f"file '{p}'\n")
 
-        output_path = f"{workdir}/{output_name}"
+    output_path = f"{workdir}/{output_name}"
 
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_file,
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "main",
-                "-level", "4.0",
-                "-c:a", "aac",
-                "-ar", "44100",
-                output_path
-            ],
-            check=True,
-            timeout=600
-        )
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "main",
+            "-level", "4.0",
+            "-c:a", "aac",
+            "-ar", "44100",
+            output_path
+        ],
+        check=True,
+        timeout=600
+    )
 
-        return FileResponse(
-            output_path,
-            media_type="video/mp4",
-            filename=output_name
-        )
+    # ✅ Schedule cleanup AFTER response is sent
+    background_tasks.add_task(shutil.rmtree, workdir, True)
 
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    return FileResponse(
+        output_path,
+        media_type="video/mp4",
+        filename=output_name
+    )
