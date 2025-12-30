@@ -3,6 +3,8 @@ from fastapi.responses import FileResponse
 import subprocess
 import requests
 import os
+import uuid
+import shutil
 
 app = FastAPI()
 
@@ -54,27 +56,52 @@ def render_scene(payload: dict):
 
 @app.post("/concat")
 def concat_videos(payload: dict):
+    videos = payload["videos"]
+    output_name = payload.get("output_name", "final.mp4")
+
+    job_id = str(uuid.uuid4())
+    workdir = f"/tmp/{job_id}"
+    os.makedirs(workdir, exist_ok=True)
+
     try:
-        videos = payload["videos"]  # list of public URLs
-    except KeyError:
-        raise HTTPException(status_code=400, detail="Missing videos list")
+        local_files = []
+        for i, url in enumerate(videos):
+            path = f"{workdir}/scene_{i}.mp4"
+            download_video(url, path)
+            local_files.append(path)
 
-    with open("list.txt", "w") as f:
-        for url in videos:
-            f.write(f"file '{url}'\n")
+        list_file = f"{workdir}/list.txt"
+        with open(list_file, "w") as f:
+            for p in local_files:
+                f.write(f"file '{p}'\n")
 
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", "list.txt",
-        "-c", "copy",
-        "final.mp4"
-    ], check=True)
+        output_path = f"{workdir}/{output_name}"
 
-    return FileResponse(
-        "final.mp4",
-        media_type="video/mp4",
-        filename="final.mp4"
-    )
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                "-level", "4.0",
+                "-c:a", "aac",
+                "-ar", "44100",
+                output_path
+            ],
+            check=True,
+            timeout=600
+        )
+
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename=output_name
+        )
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
