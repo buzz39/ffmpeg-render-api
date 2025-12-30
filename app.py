@@ -208,7 +208,7 @@ def render_scene_cinematic(payload: dict):
             "-filter_complex",
             (
                 "zoompan="
-                f"z='1+{shot['zoom']}*n':"
+                f"z='1+{shot['zoom']}*on':"
                 "x='iw/2-(iw/zoom/2)':"
                 "y='ih/2-(ih/zoom/2)':"
                 f"d={frames},"
