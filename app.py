@@ -5,6 +5,7 @@ import requests
 import os
 import uuid
 import shutil
+import json
 
 def download_video(url: str, output_path: str):
     with requests.get(url, stream=True, timeout=60) as r:
@@ -184,55 +185,107 @@ def render_with_music(payload: dict):
 
 @app.post("/render_scene_v2")
 def render_scene_v2(payload: dict):
-    scene = str(payload["scene"])
-    image_url = payload["image_url"]
-    audio_url = payload["audio_url"]
+    try:
+        scene = str(payload["scene"])
+        image_url = payload["image_url"]
+        audio_url = payload["audio_url"]
+        shots = payload.get("shots", [])
+    except KeyError:
+        raise HTTPException(status_code=400, detail="Missing required fields")
 
-    shots = payload.get("shots", [
-        {"zoom": 0.0005, "duration": 4},
-        {"zoom": 0.0010, "duration": 6},
-        {"zoom": 0.0015, "duration": 5}
-    ])
+    if not shots:
+        raise HTTPException(status_code=400, detail="Shots array is required")
 
     image_file = f"{scene}.png"
     audio_file = f"{scene}.mp3"
+
+    # Download image
+    r = requests.get(image_url, timeout=60)
+    r.raise_for_status()
+    with open(image_file, "wb") as f:
+        f.write(r.content)
+
+    # Download audio
+    r = requests.get(audio_url, timeout=60)
+    r.raise_for_status()
+    with open(audio_file, "wb") as f:
+        f.write(r.content)
+
+    # 🔍 Get audio duration (seconds)
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            audio_file
+        ],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    audio_duration = float(json.loads(result.stdout)["format"]["duration"])
+
+    # 🧠 Normalize shot durations to audio length
+    total_weight = sum(shot.get("weight", 1) for shot in shots)
+
+    normalized_shots = []
+    for shot in shots:
+        weight = shot.get("weight", 1)
+        duration = (weight / total_weight) * audio_duration
+        normalized_shots.append({
+            "zoom": shot.get("zoom", 0.0008),
+            "duration": duration
+        })
+
     shot_files = []
 
-    open(image_file, "wb").write(requests.get(image_url).content)
-    open(audio_file, "wb").write(requests.get(audio_url).content)
-
-    for i, shot in enumerate(shots):
+    # 🎞️ Render each shot
+    for i, shot in enumerate(normalized_shots):
         out = f"{scene}_shot_{i}.mp4"
         shot_files.append(out)
 
-        ffmpeg_run([
+        subprocess.run([
             "ffmpeg", "-y",
             "-loop", "1", "-i", image_file,
             "-i", audio_file,
             "-filter_complex",
             (
-                f"zoompan=z='min(zoom+{shot['zoom']},1.12)':"
-                f"d={shot['duration'] * 25}"
+                f"zoompan="
+                f"z='min(zoom+{shot['zoom']},1.15)':"
+                f"x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':"
+                f"d={int(shot['duration'] * 25)},"
+                f"scale=1280:720"
             ),
             "-t", str(shot["duration"]),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
             out
-        ])
+        ], check=True)
 
+    # 📎 Concat shots
     list_file = f"{scene}_shots.txt"
     with open(list_file, "w") as f:
         for s in shot_files:
             f.write(f"file '{s}'\n")
 
-    final_out = f"{scene}_edited.mp4"
-    ffmpeg_run([
+    final_output = f"{scene}_cinematic.mp4"
+
+    subprocess.run([
         "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
+        "-f", "concat",
+        "-safe", "0",
         "-i", list_file,
         "-c", "copy",
-        final_out
-    ])
+        final_output
+    ], check=True)
 
-    return FileResponse(final_out, media_type="video/mp4")
+    return FileResponse(
+        final_output,
+        media_type="video/mp4",
+        filename=final_output
+    )
 
 @app.post("/render_hook")
 def render_hook(payload: dict):
