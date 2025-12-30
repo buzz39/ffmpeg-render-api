@@ -6,6 +6,14 @@ import os
 import uuid
 import shutil
 
+def download_video(url: str, output_path: str):
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
 app = FastAPI()
 
 @app.post("/render")
