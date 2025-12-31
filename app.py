@@ -165,19 +165,16 @@ def render_hook(payload: dict):
 def render_scene_cinematic(payload: dict):
     try:
         scene = str(payload["scene"])
-        # We now expect a LIST of 3 image URLs
-        image_urls = payload["image_urls"] 
+        image_urls = payload["image_urls"]
         audio_url = payload["audio_url"]
     except KeyError:
-        raise HTTPException(400, "Missing required fields. Need image_urls (list)")
+        raise HTTPException(400, "Missing fields")
 
     job = f"/tmp/{uuid.uuid4()}"
     os.makedirs(job, exist_ok=True)
     audio_path = f"{job}/audio.mp3"
     download(audio_url, audio_path)
-    
     total_duration = audio_duration(audio_path)
-    # Split the time between the 3 images
     time_per_shot = total_duration / len(image_urls)
     
     clip_files = []
@@ -186,16 +183,23 @@ def render_scene_cinematic(payload: dict):
         clip_path = f"{job}/clip_{i}.mp4"
         download(url, img_path)
         
-        # Vary the zoom for each shot to keep it interesting
-        # Shot 1: Slow zoom in, Shot 2: Slow zoom out, Shot 3: Fast zoom in
-        zooms = ["0.0005", "-0.0005", "0.001"]
+        # Shot directions: In, Out, In
+        zooms = ["0.001", "-0.0005", "0.0015"]
         z_val = zooms[i] if i < len(zooms) else "0.0007"
-        
+        frames = int(time_per_shot * 30)
+
         ffmpeg([
             "ffmpeg", "-y", "-loop", "1", "-i", img_path,
             "-filter_complex", 
-            f"zoompan=z='1+{z_val}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={int(time_per_shot*30)}:s=1280x720,fps=30",
-            "-t", str(time_per_shot), "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", clip_path
+            (
+                # STEP 1: Scale to 4x size (e.g. 5120x2880) to kill jitter
+                "scale=5120:-1," 
+                # STEP 2: Zoom on the high-res canvas
+                f"zoompan=z='1+{z_val}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=30,"
+                # STEP 3: Final sharpen for that "Viral" look
+                "unsharp=3:3:1.5:3:3:0.5"
+            ),
+            "-t", str(time_per_shot), "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", clip_path
         ])
         clip_files.append(clip_path)
 
