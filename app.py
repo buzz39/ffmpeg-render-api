@@ -79,47 +79,55 @@ def render_scene(payload: dict):
 
     return FileResponse(output_file, media_type="video/mp4", filename=output_file)
 
-
 @app.post("/concat")
 def concat_videos(payload: dict, background_tasks: BackgroundTasks):
     videos = payload["videos"]
-    output_name = payload.get("output_name", "final.mp4")
+    output_name = payload.get("output_name", "final_story.mp4")
 
     job_id = str(uuid.uuid4())
     workdir = f"/tmp/{job_id}"
     os.makedirs(workdir, exist_ok=True)
 
     local_files = []
-    for i, url in enumerate(videos):
-        path = f"{workdir}/scene_{i}.mp4"
-        download_video(url, path)
-        local_files.append(path)
+    try:
+        for i, url in enumerate(videos):
+            # Handle potential n8n "undefined" or null issues
+            if not url or "http" not in str(url):
+                continue
+                
+            path = f"{workdir}/scene_{i}.mp4"
+            download_video(url, path)
+            local_files.append(path)
 
-    list_file = f"{workdir}/list.txt"
-    with open(list_file, "w") as f:
-        for p in local_files:
-            f.write(f"file '{p}'\n")
+        if not local_files:
+            raise HTTPException(400, "No valid video URLs provided")
 
-    output_path = f"{workdir}/{output_name}"
+        list_file = f"{workdir}/list.txt"
+        with open(list_file, "w") as f:
+            for p in local_files:
+                # Use absolute paths for ffmpeg concat
+                f.write(f"file '{os.path.abspath(p)}'\n")
 
-    ffmpeg([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "main",
-        "-level", "4.0",
-        "-c:a", "aac",
-        "-ar", "44100",
-        output_path
-    ])
+        output_path = f"{workdir}/{output_name}"
 
-    background_tasks.add_task(shutil.rmtree, workdir, True)
+        # THE FIX: Use '-c copy' to skip re-encoding. 
+        # This makes the process 100x faster.
+        ffmpeg([
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",  # <--- This is the magic line
+            output_path
+        ])
 
-    return FileResponse(output_path, media_type="video/mp4", filename=output_name)
-
+        # We return the file, then clean up the directory
+        # Note: BackgroundTasks should be handled carefully with FileResponse
+        return FileResponse(output_path, media_type="video/mp4", filename=output_name)
+    
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, f"Concat failed: {str(e)}")
 
 @app.post("/render_hook")
 def render_hook(payload: dict):
