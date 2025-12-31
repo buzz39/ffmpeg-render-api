@@ -163,99 +163,52 @@ def render_hook(payload: dict):
 
 @app.post("/render_scene_cinematic")
 def render_scene_cinematic(payload: dict):
-    """
-    Renders ONE scene as a cinematic video.
-    - Audio length drives timing
-    - Multiple weighted shots
-    - Silent clips → concat → mux audio once
-    """
-
     try:
         scene = str(payload["scene"])
-        image_url = payload["image_url"]
+        # We now expect a LIST of 3 image URLs
+        image_urls = payload["image_urls"] 
         audio_url = payload["audio_url"]
-        shots = payload["shots"]
     except KeyError:
-        raise HTTPException(400, "Missing required fields")
-
-    if not shots:
-        raise HTTPException(400, "Shots array required")
+        raise HTTPException(400, "Missing required fields. Need image_urls (list)")
 
     job = f"/tmp/{uuid.uuid4()}"
     os.makedirs(job, exist_ok=True)
-
-    image_path = f"{job}/image.png"
     audio_path = f"{job}/audio.mp3"
-    silent_scene = f"{job}/scene_silent.mp4"
-    final_scene = f"{job}/scene_final.mp4"
-
-    download(image_url, image_path)
     download(audio_url, audio_path)
-
-    total_audio = audio_duration(audio_path)
-
-    total_weight = sum(s.get("weight", 1) for s in shots)
-    timeline = []
-    for s in shots:
-        timeline.append({
-            "zoom": s.get("zoom", 0.0008),
-            "duration": (s.get("weight", 1) / total_weight) * total_audio
-        })
-
+    
+    total_duration = audio_duration(audio_path)
+    # Split the time between the 3 images
+    time_per_shot = total_duration / len(image_urls)
+    
     clip_files = []
-
-    for i, shot in enumerate(timeline):
-        clip = f"{job}/clip_{i}.mp4"
-        clip_files.append(clip)
-
-        frames = int(shot["duration"] * 30)
-
+    for i, url in enumerate(image_urls):
+        img_path = f"{job}/img_{i}.png"
+        clip_path = f"{job}/clip_{i}.mp4"
+        download(url, img_path)
+        
+        # Vary the zoom for each shot to keep it interesting
+        # Shot 1: Slow zoom in, Shot 2: Slow zoom out, Shot 3: Fast zoom in
+        zooms = ["0.0005", "-0.0005", "0.001"]
+        z_val = zooms[i] if i < len(zooms) else "0.0007"
+        
         ffmpeg([
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", image_path,
-            "-filter_complex",
-            (
-                "zoompan="
-                f"z='1+{shot['zoom']}*on':"
-                "x='iw/2-(iw/zoom/2)':"
-                "y='ih/2-(ih/zoom/2)':"
-                f"d={frames},"
-                "fps=30,"
-                "scale=1280:720"
-            ),
-            "-t", str(shot["duration"]),
-            "-an",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            clip
+            "ffmpeg", "-y", "-loop", "1", "-i", img_path,
+            "-filter_complex", 
+            f"zoompan=z='1+{z_val}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={int(time_per_shot*30)}:s=1280x720,fps=30",
+            "-t", str(time_per_shot), "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", clip_path
         ])
+        clip_files.append(clip_path)
 
-    concat_list = f"{job}/list.txt"
-    with open(concat_list, "w") as f:
-        for c in clip_files:
-            f.write(f"file '{c}'\n")
+    # Concat the 3 shots together
+    list_path = f"{job}/list.txt"
+    with open(list_path, "w") as f:
+        for c in clip_files: f.write(f"file '{c}'\n")
+    
+    merged_silent = f"{job}/merged.mp4"
+    ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", merged_silent])
 
-    ffmpeg([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_list,
-        "-c", "copy",
-        silent_scene
-    ])
+    # Add the audio back
+    final_path = f"{job}/final.mp4"
+    ffmpeg(["ffmpeg", "-y", "-i", merged_silent, "-i", audio_path, "-c:v", "copy", "-c:a", "aac", "-shortest", final_path])
 
-    ffmpeg([
-        "ffmpeg", "-y",
-        "-i", silent_scene,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        final_scene
-    ])
-
-    return FileResponse(
-        final_scene,
-        media_type="video/mp4",
-        filename=f"{scene}.mp4"
-    )
+    return FileResponse(final_path, media_type="video/mp4")
