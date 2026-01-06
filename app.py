@@ -112,10 +112,17 @@ async def render_scene_v3_subtitles(payload: dict):
         if bgm_url and str(bgm_url).lower() != "none":
             bgm_local = f"{job_path}/bgm.mp3"
             download_file(bgm_url, bgm_local)
+                
+            # MIXING LOGIC:
+            # [1:a] is the Narration (Volume 1.0)
+            # [2:a] is the BGM (Volume 0.12 - Very quiet)
             run_ffmpeg([
-                "ffmpeg", "-y", "-i", merged_silent, "-i", audio_local, "-i", bgm_local,
-                "-filter_complex", "[2:a]volume=0.12[bg];[1:a][bg]amix=inputs=2:duration=first",
-                "-c:v", "copy", "-c:a", "aac", "-shortest", final_video
+                "ffmpeg", "-y", 
+                "-i", merged_silent, 
+                "-i", audio_local, 
+                "-i", bgm_local,
+                "-filter_complex", "[1:a]volume=1.2[v]; [2:a]volume=0.10[bg]; [v][bg]amix=inputs=2:duration=first",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", final_video
             ])
         else:
             run_ffmpeg(["ffmpeg", "-y", "-i", merged_silent, "-i", audio_local, "-c:v", "copy", "-c:a", "aac", "-shortest", final_video])
