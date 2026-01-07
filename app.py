@@ -137,22 +137,34 @@ def concat_videos(payload: dict):
 # FINAL BRANDING ENDPOINT
 # =====================================================
 
+from fastapi import BackgroundTasks
+
+# ... (keep your other imports and utilities)
+
 @app.post("/apply_branding")
 async def apply_branding(payload: dict, background_tasks: BackgroundTasks):
-    try:
-        video_url = payload["video_url"]
-        watermark_url = payload["watermark_url"]
-        callback_url = payload.get("callback_url") # n8n Webhook to notify when done
-        output_name = payload.get("output_name", "branded_final.mp4")
-    except KeyError:
+    """
+    Starts the branding process and returns immediately to n8n.
+    """
+    video_url = payload.get("video_url")
+    watermark_url = payload.get("watermark_url")
+    resume_url = payload.get("resume_url") # The n8n Wait URL
+    output_name = payload.get("output_name", "branded_final.mp4")
+
+    if not video_url or not watermark_url:
         raise HTTPException(400, "Missing video_url or watermark_url")
 
-    # Start the background process
-    background_tasks.add_task(process_branding_task, video_url, watermark_url, callback_url, output_name)
+    # This starts the heavy work in the background
+    background_tasks.add_task(
+        process_branding_and_callback, 
+        video_url, watermark_img_url=watermark_url, 
+        resume_url=resume_url, 
+        output_name=output_name
+    )
 
-    return {"status": "processing", "message": "Job started in background. n8n will be notified via callback."}
+    return {"status": "accepted", "message": "Branding started. n8n will be notified."}
 
-async def process_branding_task(video_url, watermark_url, callback_url, output_name):
+def process_branding_and_callback(video_url, watermark_img_url, resume_url, output_name):
     job_id = str(uuid.uuid4())
     workdir = f"{TEMP_DIR}/{job_id}"
     os.makedirs(workdir, exist_ok=True)
@@ -162,34 +174,34 @@ async def process_branding_task(video_url, watermark_url, callback_url, output_n
     output_video = f"{workdir}/{output_name}"
 
     try:
-        # 1. Download
+        # 1. Download assets using your existing download_asset function
         download_asset(video_url, input_video, "Main Video")
-        download_asset(watermark_url, watermark_img, "Watermark")
+        download_asset(watermark_img_url, watermark_img, "Watermark")
 
-        # 2. FFmpeg (Re-encoding with -threads 0 for max speed)
-        subprocess.run([
+        # 2. Run FFmpeg (High Speed)
+        # Using ultrafast to prevent long server-side wait
+        cmd = [
             "ffmpeg", "-y", "-i", input_video, "-i", watermark_img,
             "-filter_complex", "[1:v]scale=200:-1,format=rgba,colorchannelmixer=aa=0.4[wm];[0:v][wm]overlay=W-w-30:30",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-c:a", "copy", "-threads", "0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-c:a", "copy", "-threads", "0",
             output_video
-        ], check=True)
+        ]
+        subprocess.run(cmd, check=True)
 
-        # 3. NOTIFY n8n (This is the magic part)
-        if callback_url:
-            async with httpx.AsyncClient() as client:
-                # We send the final file location (assuming you have a way to serve it or upload it to R2)
-                # For now, we will assume you want to trigger an R2 upload node in n8n
-                await client.post(callback_url, json={
-                    "status": "completed",
-                    "video_name": output_name,
-                    "local_path": output_video, # Your server path
-                    "message": "Video branding finished successfully"
-                })
+        # 3. Callback to n8n (Wakes up the Wait Node)
+        if resume_url:
+            # We use requests here. Since this is in a background thread, 
+            # it doesn't block the main API.
+            requests.post(resume_url, json={
+                "status": "success",
+                "video_url": f"http://YOUR_SERVER_IP_OR_FQDN/download/{job_id}/{output_name}",
+                "message": "Branding complete"
+            })
 
     except Exception as e:
-        if callback_url:
-            async with httpx.AsyncClient() as client:
-                await client.post(callback_url, json={"status": "error", "error": str(e)})
+        print(f"Branding Task Failed: {e}")
+        if resume_url:
+            requests.post(resume_url, json={"status": "error", "error": str(e)})
 
 # =====================================================
 # SYSTEM ROUTES
