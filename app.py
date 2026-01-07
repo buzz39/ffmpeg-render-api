@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-import subprocess, requests, os, uuid, shutil, json, time, textwrap, httpx
+import subprocess, requests, os, uuid, shutil, json, time, textwrap
 
 app = FastAPI()
 
@@ -12,32 +12,19 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Run 'ls /usr/share/fonts/truetype/noto/' to check.
 FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"
 
-# =====================================================
-# Utilities
-# =====================================================
-
-def ffmpeg(cmd: list):
-    """Utility to run subprocess commands consistently."""
-    subprocess.run(cmd, check=True)
-
 def download_asset(url: str, path: str, label: str):
-    """Standard downloader used across all endpoints."""
     if not url or str(url).lower() in ["none", "undefined", "null", ""]:
         return False
     try:
-        r = requests.get(url, timeout=60, stream=True)
+        r = requests.get(url, timeout=30)
         r.raise_for_status()
+        if len(r.content) < 500:
+            return False
         with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+            f.write(r.content)
         return True
-    except Exception as e:
-        print(f"Download failed for {label}: {e}")
+    except:
         return False
-
-# =====================================================
-# CINEMATIC RENDERER WITH AUTO-SUBTITLES
-# =====================================================
 
 @app.post("/render_scene_v3_subtitles")
 async def render_scene_v3_subtitles(payload: dict):
@@ -55,8 +42,7 @@ async def render_scene_v3_subtitles(payload: dict):
         if not download_asset(audio_url, audio_local, "Audio"):
             raise Exception("Audio download failed.")
 
-        duration_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_local]
-        duration = float(subprocess.run(duration_cmd, capture_output=True, text=True).stdout.strip())
+        duration = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_local], capture_output=True, text=True).stdout.strip())
         
         valid_images = []
         for i, url in enumerate(image_urls):
@@ -80,27 +66,23 @@ async def render_scene_v3_subtitles(payload: dict):
             fr = int(time_per_shot * 30)
             drawtext = f",drawtext=text='{clean_sub}':fontfile={FONT_PATH}:fontcolor=white:fontsize=40:box=1:boxcolor=black@0.5:boxborderw=20:line_spacing=15:x=(w-text_w)/2:y=h-160" if os.path.exists(FONT_PATH) else ""
             filters = f"scale=4000:-1,setsar=1/1,zoompan=z='1+{z}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={fr}:s=1280x720:fps=30,scale=1280:720{drawtext},unsharp=3:3:1.5"
-            ffmpeg(["ffmpeg", "-y", "-loop", "1", "-i", valid_images[i], "-filter_complex", filters, "-t", str(time_per_shot), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out])
+            subprocess.run(["ffmpeg", "-y", "-loop", "1", "-i", valid_images[i], "-filter_complex", filters, "-t", str(time_per_shot), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out], check=True)
             clip_files.append(out)
 
         merged = f"{job_path}/merged.mp4"
         with open(f"{job_path}/list.txt", "w") as f:
             for c in clip_files: f.write(f"file '{os.path.abspath(c)}'\n")
-        ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", f"{job_path}/list.txt", "-c", "copy", merged])
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", f"{job_path}/list.txt", "-c", "copy", merged], check=True)
 
         final = f"{job_path}/final.mp4"
         if download_asset(bgm_url, f"{job_path}/bgm.mp3", "BGM"):
-            ffmpeg(["ffmpeg", "-y", "-i", merged, "-i", audio_local, "-i", f"{job_path}/bgm.mp3", "-filter_complex", "[1:a]volume=1.3[v]; [2:a]volume=0.08[bg]; [v][bg]amix=inputs=2:duration=first", "-c:v", "copy", "-c:a", "aac", "-shortest", final])
+            subprocess.run(["ffmpeg", "-y", "-i", merged, "-i", audio_local, "-i", f"{job_path}/bgm.mp3", "-filter_complex", "[1:a]volume=1.3[v]; [2:a]volume=0.08[bg]; [v][bg]amix=inputs=2:duration=first", "-c:v", "copy", "-c:a", "aac", "-shortest", final], check=True)
         else:
-            ffmpeg(["ffmpeg", "-y", "-i", merged, "-i", audio_local, "-c:v", "copy", "-c:a", "aac", "-shortest", final])
+            subprocess.run(["ffmpeg", "-y", "-i", merged, "-i", audio_local, "-c:v", "copy", "-c:a", "aac", "-shortest", final], check=True)
 
         return FileResponse(final, media_type="video/mp4")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# =====================================================
-# FAST CONCAT ENDPOINT
-# =====================================================
 
 @app.post("/concat")
 def concat_videos(payload: dict):
@@ -113,111 +95,55 @@ def concat_videos(payload: dict):
         output_name = payload.get("output_name", "final_story.mp4")
         local_files = []
         
+        # 1. Download only VALID URLs
         for i, url in enumerate(videos):
+            if not url or "http" not in str(url):
+                print(f"Skipping empty video URL at index {i}")
+                continue
+                
             path = f"{workdir}/s_{i}.mp4"
-            if download_asset(url, path, f"Scene_{i}"):
+            # Use a simple download here since these are internal rendered files
+            r = requests.get(url, timeout=60)
+            if r.status_code == 200 and len(r.content) > 1000: # Ensure it's not an empty file
+                with open(path, "wb") as f:
+                    f.write(r.content)
                 local_files.append(path)
 
         if not local_files:
             raise Exception("No valid scene videos found to join.")
 
+        # 2. Create the FFmpeg instructions file
         list_file = f"{workdir}/list.txt"
         with open(list_file, "w") as f:
             for p in local_files:
                 f.write(f"file '{os.path.abspath(p)}'\n")
 
+        # 3. Stitch them together (No re-encoding = Instant)
         output_path = f"{workdir}/{output_name}"
-        ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", output_path])
+        # '-c copy' is critical here. It makes it 100x faster and maintains 100% quality.
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", output_path], check=True)
 
         return FileResponse(output_path, media_type="video/mp4", filename=output_name)
+
     except Exception as e:
+        print(f"CONCAT FAILED: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =====================================================
-# FINAL BRANDING ENDPOINT
+# THE MISSING CLEANUP ROUTE
 # =====================================================
-
-from fastapi import BackgroundTasks
-
-# ... (keep your other imports and utilities)
-
-@app.post("/apply_branding")
-async def apply_branding(payload: dict, background_tasks: BackgroundTasks):
-    """
-    Starts the branding process and returns immediately to n8n.
-    """
-    video_url = payload.get("video_url")
-    watermark_url = payload.get("watermark_url")
-    resume_url = payload.get("resume_url") # The n8n Wait URL
-    output_name = payload.get("output_name", "branded_final.mp4")
-
-    if not video_url or not watermark_url:
-        raise HTTPException(400, "Missing video_url or watermark_url")
-
-    # This starts the heavy work in the background
-    background_tasks.add_task(
-        process_branding_and_callback, 
-        video_url, watermark_img_url=watermark_url, 
-        resume_url=resume_url, 
-        output_name=output_name
-    )
-
-    return {"status": "accepted", "message": "Branding started. n8n will be notified."}
-
-def process_branding_and_callback(video_url, watermark_img_url, resume_url, output_name):
-    job_id = str(uuid.uuid4())
-    workdir = f"{TEMP_DIR}/{job_id}"
-    os.makedirs(workdir, exist_ok=True)
-    
-    input_video = f"{workdir}/input.mp4"
-    watermark_img = f"{workdir}/watermark.png"
-    output_video = f"{workdir}/{output_name}"
-
-    try:
-        # 1. Download assets using your existing download_asset function
-        download_asset(video_url, input_video, "Main Video")
-        download_asset(watermark_img_url, watermark_img, "Watermark")
-
-        # 2. Run FFmpeg (High Speed)
-        # Using ultrafast to prevent long server-side wait
-        cmd = [
-            "ffmpeg", "-y", "-i", input_video, "-i", watermark_img,
-            "-filter_complex", "[1:v]scale=200:-1,format=rgba,colorchannelmixer=aa=0.4[wm];[0:v][wm]overlay=W-w-30:30",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-c:a", "copy", "-threads", "0",
-            output_video
-        ]
-        subprocess.run(cmd, check=True)
-
-        # 3. Callback to n8n (Wakes up the Wait Node)
-        if resume_url:
-            # We use requests here. Since this is in a background thread, 
-            # it doesn't block the main API.
-            requests.post(resume_url, json={
-                "status": "success",
-                "video_url": f"http://YOUR_SERVER_IP_OR_FQDN/download/{job_id}/{output_name}",
-                "message": "Branding complete"
-            })
-
-    except Exception as e:
-        print(f"Branding Task Failed: {e}")
-        if resume_url:
-            requests.post(resume_url, json={"status": "error", "error": str(e)})
-
-# =====================================================
-# SYSTEM ROUTES
-# =====================================================
-
 @app.get("/cleanup")
 def cleanup_system(max_age_hours: int = 1):
     now = time.time()
     count = 0
     for folder in os.listdir(TEMP_DIR):
         path = os.path.join(TEMP_DIR, folder)
-        if os.path.isdir(path) and os.stat(path).st_mtime < now - (max_age_hours * 3600):
+        if os.stat(path).st_mtime < now - (max_age_hours * 3600):
             shutil.rmtree(path, ignore_errors=True)
             count += 1
     return {"status": "success", "cleared": count}
 
+# Root route for health check
 @app.get("/")
 def read_root():
-    return {"status": "Render API is online", "endpoints": ["/render_scene_v3_subtitles", "/concat", "/apply_branding", "/cleanup"]}
+    return {"status": "Render API is Online"}
