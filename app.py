@@ -25,13 +25,31 @@ def run_ffmpeg(cmd: list):
         print(f"FFmpeg Error: {e.stderr}")
         raise Exception(f"FFmpeg failed: {e.stderr}")
 
-def download_file(url: str, path: str):
+def download_file(url: str, path: str, retries=5):
+    """Downloads a file and verifies it is not a Cloudflare error page."""
     if not url or str(url).lower() in ["none", "undefined", "null", ""]:
         raise ValueError(f"Invalid URL provided: {url}")
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        f.write(r.content)
+    
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            
+            # Check if the response is actually an image/audio or an XML error
+            content_type = r.headers.get('Content-Type', '').lower()
+            if "xml" in content_type or "text" in content_type:
+                print(f"R2 Sync Delay: {url} returned XML. Retrying in 3s... (Attempt {i+1})")
+                time.sleep(3)
+                continue
+                
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return # Success
+            
+        except Exception as e:
+            if i == retries - 1:
+                raise HTTPException(status_code=500, detail=f"Failed to download {url} after {retries} attempts: {str(e)}")
+            time.sleep(3)
 
 def get_audio_duration(path: str) -> float:
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path]
