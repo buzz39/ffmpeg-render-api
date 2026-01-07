@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
-import subprocess, requests, os, uuid, shutil, json, time, textwrap
+import subprocess, requests, os, uuid, shutil, json, time, textwrap, httpx
 
 app = FastAPI()
 
@@ -138,14 +138,21 @@ def concat_videos(payload: dict):
 # =====================================================
 
 @app.post("/apply_branding")
-def apply_branding(payload: dict):
+async def apply_branding(payload: dict, background_tasks: BackgroundTasks):
     try:
         video_url = payload["video_url"]
         watermark_url = payload["watermark_url"]
+        callback_url = payload.get("callback_url") # n8n Webhook to notify when done
         output_name = payload.get("output_name", "branded_final.mp4")
     except KeyError:
         raise HTTPException(400, "Missing video_url or watermark_url")
 
+    # Start the background process
+    background_tasks.add_task(process_branding_task, video_url, watermark_url, callback_url, output_name)
+
+    return {"status": "processing", "message": "Job started in background. n8n will be notified via callback."}
+
+async def process_branding_task(video_url, watermark_url, callback_url, output_name):
     job_id = str(uuid.uuid4())
     workdir = f"{TEMP_DIR}/{job_id}"
     os.makedirs(workdir, exist_ok=True)
@@ -154,27 +161,35 @@ def apply_branding(payload: dict):
     watermark_img = f"{workdir}/watermark.png"
     output_video = f"{workdir}/{output_name}"
 
-    if not download_asset(video_url, input_video, "Main Video"):
-        raise HTTPException(500, "Could not download the main video")
-    
-    if not download_asset(watermark_url, watermark_img, "Watermark"):
-        raise HTTPException(500, "Could not download the watermark image")
+    try:
+        # 1. Download
+        download_asset(video_url, input_video, "Main Video")
+        download_asset(watermark_url, watermark_img, "Watermark")
 
-    # FFmpeg: Overlay watermark with 40% transparency (aa=0.4)
-    ffmpeg([
-        "ffmpeg", "-y",
-        "-i", input_video,
-        "-i", watermark_img,
-        "-filter_complex", 
-        "[1:v]scale=200:-1,format=rgba,colorchannelmixer=aa=0.4[wm];[0:v][wm]overlay=W-w-30:30",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        "-c:a", "copy", 
-        output_video
-    ])
+        # 2. FFmpeg (Re-encoding with -threads 0 for max speed)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_video, "-i", watermark_img,
+            "-filter_complex", "[1:v]scale=200:-1,format=rgba,colorchannelmixer=aa=0.4[wm];[0:v][wm]overlay=W-w-30:30",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-c:a", "copy", "-threads", "0",
+            output_video
+        ], check=True)
 
-    return FileResponse(output_video, media_type="video/mp4", filename=output_name)
+        # 3. NOTIFY n8n (This is the magic part)
+        if callback_url:
+            async with httpx.AsyncClient() as client:
+                # We send the final file location (assuming you have a way to serve it or upload it to R2)
+                # For now, we will assume you want to trigger an R2 upload node in n8n
+                await client.post(callback_url, json={
+                    "status": "completed",
+                    "video_name": output_name,
+                    "local_path": output_video, # Your server path
+                    "message": "Video branding finished successfully"
+                })
+
+    except Exception as e:
+        if callback_url:
+            async with httpx.AsyncClient() as client:
+                await client.post(callback_url, json={"status": "error", "error": str(e)})
 
 # =====================================================
 # SYSTEM ROUTES
