@@ -20,11 +20,6 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Run 'ls /usr/share/fonts/truetype/noto/' to check.
 FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"
 
-# Simple concurrent job limiting for 3-core server
-import threading
-render_lock = threading.Lock()
-MAX_CONCURRENT_RENDERS = 1  # Only 1 render at a time on 3-core server
-
 def download_asset(url: str, path: str, label: str) -> bool:
     if not url or str(url).lower() in ["none", "undefined", "null", ""]:
         logger.warning(f"{label}: Empty or invalid URL provided")
@@ -49,27 +44,21 @@ def download_asset(url: str, path: str, label: str) -> bool:
 
 @app.post("/render_scene_v3_subtitles")
 async def render_scene_v3_subtitles(payload: dict):
-    # Check if server is already busy (protect 3-core server)
-    if not render_lock.acquire(blocking=False):
-        logger.warning("Render request rejected - server busy with another render job")
-        raise HTTPException(status_code=503, detail="Server is currently processing another render job. Please try again in a few minutes.")
-    
     job_id = str(uuid.uuid4())
     job_path = f"{TEMP_DIR}/{job_id}"
     os.makedirs(job_path, exist_ok=True)
     
-    try:
-        logger.info(f"Starting render job {job_id}")
-        logger.debug(f"Payload keys: {list(payload.keys())}")
-        
-        # Input validation
-        if not payload.get("audio_url"):
-            logger.error(f"Job {job_id}: Missing audio_url")
-            raise HTTPException(status_code=400, detail="audio_url is required")
-        
-        if not payload.get("image_urls") or not isinstance(payload.get("image_urls"), list):
-            logger.error(f"Job {job_id}: Missing or invalid image_urls")
-            raise HTTPException(status_code=400, detail="image_urls must be a non-empty list")
+    logger.info(f"Starting render job {job_id}")
+    logger.debug(f"Payload keys: {list(payload.keys())}")
+    
+    # Input validation
+    if not payload.get("audio_url"):
+        logger.error(f"Job {job_id}: Missing audio_url")
+        raise HTTPException(status_code=400, detail="audio_url is required")
+    
+    if not payload.get("image_urls") or not isinstance(payload.get("image_urls"), list):
+        logger.error(f"Job {job_id}: Missing or invalid image_urls")
+        raise HTTPException(status_code=400, detail="image_urls must be a non-empty list")
     
     try:
         scene = str(payload.get("scene", "1"))
@@ -141,12 +130,10 @@ async def render_scene_v3_subtitles(payload: dict):
             
             logger.info(f"Job {job_id}: Rendering clip {i+1}/3 (duration: {time_per_shot:.2f}s)")
             try:
-                # Optimized for 3-core CPU: use 2 threads to leave 1 core free for system
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", valid_images[i], 
                     "-filter_complex", filters, "-t", str(time_per_shot), 
-                    "-c:v", "libx264", "-threads", "2", "-preset", "medium", 
-                    "-pix_fmt", "yuv420p", "-crf", "20", "-maxrate", "5M", "-bufsize", "10M", out
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out
                 ], check=True, capture_output=True, text=True)
                 clip_files.append(out)
                 logger.info(f"Job {job_id}: Clip {i+1}/3 completed")
@@ -178,31 +165,19 @@ async def render_scene_v3_subtitles(payload: dict):
         logger.info(f"Job {job_id}: Adding audio tracks")
         
         try:
-            # Optimized audio mixing for 3-core server
             if download_asset(bgm_url, f"{job_path}/bgm.mp3", "BGM"):
                 logger.info(f"Job {job_id}: Adding background music")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", merged, "-i", audio_local, "-i", f"{job_path}/bgm.mp3", 
                     "-filter_complex", "[1:a]volume=1.3[v]; [2:a]volume=0.08[bg]; [v][bg]amix=inputs=2:duration=first", 
-                    "-c:v", "copy", "-c:a", "aac", "-threads", "2", "-shortest", final
+                    "-c:v", "copy", "-c:a", "aac", "-shortest", final
                 ], check=True, capture_output=True, text=True)
             else:
                 logger.info(f"Job {job_id}: Adding voice audio only")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", merged, "-i", audio_local, 
-                    "-c:v", "copy", "-c:a", "aac", "-threads", "2", "-shortest", final
+                    "-c:v", "copy", "-c:a", "aac", "-shortest", final
                 ], check=True, capture_output=True, text=True)
-            
-            # Clean up intermediate files to save disk space
-            try:
-                for clip_file in clip_files:
-                    if os.path.exists(clip_file):
-                        os.remove(clip_file)
-                if os.path.exists(merged):
-                    os.remove(merged)
-                logger.info(f"Job {job_id}: Cleaned up intermediate files")
-            except Exception as cleanup_error:
-                logger.warning(f"Job {job_id}: Cleanup warning - {str(cleanup_error)}")
             
             logger.info(f"Job {job_id}: Render completed successfully")
             return FileResponse(final, media_type="video/mp4")
@@ -217,8 +192,6 @@ async def render_scene_v3_subtitles(payload: dict):
         logger.error(f"Job {job_id}: Unexpected error - {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
-        # Always release the render lock
-        render_lock.release()
         # Cleanup job directory after a delay (to allow file response to complete)
         logger.info(f"Job {job_id}: Cleaning up temporary files")
 
@@ -308,137 +281,10 @@ def cleanup_system(max_age_hours: int = 1):
         logger.error(f"Cleanup failed: {str(e)}")
         return {"status": "error", "error": str(e), "cleared": count}
 
-@app.get("/job_status/{job_id}")
-def get_job_status(job_id: str):
-    """Check if a job is completed by looking for the final.mp4 file"""
-    job_path = os.path.join(TEMP_DIR, job_id)
-    final_path = os.path.join(job_path, "final.mp4")
-    
-    if not os.path.exists(job_path):
-        return {
-            "job_id": job_id,
-            "status": "not_found",
-            "message": "Job not found"
-        }
-    
-    if os.path.exists(final_path):
-        file_size = os.path.getsize(final_path)
-        return {
-            "job_id": job_id,
-            "status": "completed",
-            "message": "Render completed successfully",
-            "file_size_bytes": file_size,
-            "download_url": f"/download/{job_id}"
-        }
-    else:
-        # Check for any ongoing ffmpeg processes or if intermediate files exist
-        has_clips = any(os.path.exists(os.path.join(job_path, f"c_{i}.mp4")) for i in range(3))
-        has_merged = os.path.exists(os.path.join(job_path, "merged.mp4"))
-        has_audio = os.path.exists(os.path.join(job_path, "voice.mp3"))
-        
-        if has_merged:
-            status = "finalizing"
-            message = "Adding audio tracks"
-        elif has_clips:
-            status = "merging" 
-            message = "Merging video clips"
-        elif has_audio:
-            status = "rendering"
-            message = "Rendering video clips"
-        else:
-            status = "processing"
-            message = "Downloading assets and preparing"
-            
-        return {
-            "job_id": job_id,
-            "status": status,
-            "message": message
-        }
-
-@app.get("/download/{job_id}")
-def download_job_result(job_id: str):
-    """Download the completed render result"""
-    final_path = os.path.join(TEMP_DIR, job_id, "final.mp4")
-    
-    if not os.path.exists(final_path):
-        raise HTTPException(status_code=404, detail="Render not completed or file not found")
-    
-    return FileResponse(
-        final_path, 
-        media_type="video/mp4", 
-        filename=f"scene_{job_id}.mp4"
-    )
-
-@app.get("/check_file/{filename}")
-def check_file_exists(filename: str):
-    """Simple endpoint to check if a rendered file exists"""
-    # Look for the file in any job directory
-    for job_dir in os.listdir(TEMP_DIR):
-        job_path = os.path.join(TEMP_DIR, job_dir)
-        if os.path.isdir(job_path):
-            final_path = os.path.join(job_path, "final.mp4")
-            if os.path.exists(final_path):
-                return {
-                    "exists": True, 
-                    "download_url": f"/download_file/{job_dir}",
-                    "size": os.path.getsize(final_path)
-                }
-    return {"exists": False}
-
-@app.get("/download_file/{job_id}")
-def download_file(job_id: str):
-    """Download a completed render file"""
-    final_path = os.path.join(TEMP_DIR, job_id, "final.mp4")
-    if os.path.exists(final_path):
-        return FileResponse(final_path, media_type="video/mp4", filename=f"scene_{job_id}.mp4")
-    raise HTTPException(status_code=404, detail="File not found")
-
 # Health check and debug endpoints
 @app.get("/")
 def read_root():
     return {"status": "Render API is Online"}
-
-@app.get("/system_resources")
-def get_system_resources():
-    """Monitor system resources for the 3-core 8GB server"""
-    try:
-        import shutil
-        
-        # Check disk space
-        disk_usage = shutil.disk_usage(TEMP_DIR)
-        disk_free_gb = disk_usage.free / (1024**3)
-        disk_total_gb = disk_usage.total / (1024**3)
-        disk_used_percent = ((disk_usage.total - disk_usage.free) / disk_usage.total) * 100
-        
-        # Count active jobs
-        active_jobs = len([d for d in os.listdir(TEMP_DIR) if os.path.isdir(os.path.join(TEMP_DIR, d))])
-        
-        # Estimate memory usage (rough calculation)
-        temp_dir_size = sum(os.path.getsize(os.path.join(dirpath, filename))
-                           for dirpath, dirnames, filenames in os.walk(TEMP_DIR)
-                           for filename in filenames) / (1024**2)  # MB
-        
-        return {
-            "server_specs": {
-                "cpu_cores": 3,
-                "ram_gb": 8,
-                "disk_total_gb": round(disk_total_gb, 2)
-            },
-            "current_usage": {
-                "active_render_jobs": active_jobs,
-                "disk_free_gb": round(disk_free_gb, 2),
-                "disk_used_percent": round(disk_used_percent, 2),
-                "temp_files_mb": round(temp_dir_size, 2)
-            },
-            "recommendations": {
-                "max_concurrent_jobs": 1 if active_jobs == 0 else "1 job already running",
-                "disk_warning": "Low disk space" if disk_free_gb < 10 else "OK",
-                "suggested_cleanup": disk_used_percent > 80
-            }
-        }
-        
-    except Exception as e:
-        return {"error": f"Could not get system resources: {str(e)}"}
 
 @app.get("/health")
 def health_check():
@@ -518,13 +364,5 @@ def debug_system():
             
         return debug_info
         
-    except Exception as e:
-        return {"error": str(e)}
-
-# Startup configuration - important for Coolify deployment
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 3000))  # Use Coolify's PORT env var
-    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
     except Exception as e:
         return {"error": str(e)}
