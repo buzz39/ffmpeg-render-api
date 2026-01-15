@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 import subprocess, requests, os, uuid, shutil, json, time, textwrap, logging
 from typing import Optional, List
 
@@ -19,6 +19,9 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # ARCHITECT: Verify this path! 
 # Run 'ls /usr/share/fonts/truetype/noto/' to check.
 FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"
+
+# Simple job tracking for async processing
+job_status = {}
 
 def download_asset(url: str, path: str, label: str) -> bool:
     if not url or str(url).lower() in ["none", "undefined", "null", ""]:
@@ -43,24 +46,45 @@ def download_asset(url: str, path: str, label: str) -> bool:
         return False
 
 @app.post("/render_scene_v3_subtitles")
-async def render_scene_v3_subtitles(payload: dict):
+async def render_scene_v3_subtitles(payload: dict, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    job_path = f"{TEMP_DIR}/{job_id}"
-    os.makedirs(job_path, exist_ok=True)
     
-    logger.info(f"Starting render job {job_id}")
-    logger.debug(f"Payload keys: {list(payload.keys())}")
+    logger.info(f"Starting async render job {job_id}")
     
     # Input validation
     if not payload.get("audio_url"):
-        logger.error(f"Job {job_id}: Missing audio_url")
         raise HTTPException(status_code=400, detail="audio_url is required")
     
     if not payload.get("image_urls") or not isinstance(payload.get("image_urls"), list):
-        logger.error(f"Job {job_id}: Missing or invalid image_urls")
         raise HTTPException(status_code=400, detail="image_urls must be a non-empty list")
     
+    # Initialize job status
+    job_status[job_id] = {
+        "status": "processing",
+        "message": "Job started, downloading assets",
+        "created_at": time.time()
+    }
+    
+    # Start background processing
+    background_tasks.add_task(process_render_job, job_id, payload)
+    
+    # Return immediately with job_id
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Render job started successfully",
+        "check_status_url": f"/job_status/{job_id}",
+        "download_url": f"/download/{job_id}"
+    })
+
+def process_render_job(job_id: str, payload: dict):
+    """Background function to process the render job"""
+    job_path = f"{TEMP_DIR}/{job_id}"
+    os.makedirs(job_path, exist_ok=True)
+    
     try:
+        job_status[job_id] = {"status": "downloading", "message": "Downloading assets"}
+        
         scene = str(payload.get("scene", "1"))
         image_urls = payload.get("image_urls", [])
         audio_url = payload.get("audio_url")
@@ -72,7 +96,8 @@ async def render_scene_v3_subtitles(payload: dict):
         # Download audio
         audio_local = f"{job_path}/voice.mp3"
         if not download_asset(audio_url, audio_local, "Audio"):
-            raise HTTPException(status_code=400, detail="Failed to download audio file")
+            job_status[job_id] = {"status": "failed", "message": "Failed to download audio file"}
+            return
 
         # Get audio duration
         try:
@@ -84,9 +109,11 @@ async def render_scene_v3_subtitles(payload: dict):
             logger.info(f"Job {job_id}: Audio duration: {duration:.2f} seconds")
         except (subprocess.CalledProcessError, ValueError) as e:
             logger.error(f"Job {job_id}: Failed to get audio duration - {str(e)}")
-            raise HTTPException(status_code=400, detail="Invalid audio file or ffprobe error")
+            job_status[job_id] = {"status": "failed", "message": "Invalid audio file or ffprobe error"}
+            return
         
         # Download and validate images
+        job_status[job_id] = {"status": "downloading", "message": "Downloading images"}
         valid_images = []
         for i, url in enumerate(image_urls):
             path = f"{job_path}/img_{i}.png"
@@ -96,7 +123,8 @@ async def render_scene_v3_subtitles(payload: dict):
         logger.info(f"Job {job_id}: Successfully downloaded {len(valid_images)} out of {len(image_urls)} images")
 
         if not valid_images:
-            raise HTTPException(status_code=400, detail="No valid images could be downloaded")
+            job_status[job_id] = {"status": "failed", "message": "No valid images could be downloaded"}
+            return
         
         # Duplicate images if we have fewer than 3
         while len(valid_images) < 3:
@@ -115,6 +143,7 @@ async def render_scene_v3_subtitles(payload: dict):
             logger.warning(f"Job {job_id}: Font not found, subtitles will be disabled")
 
         # Create individual clips
+        job_status[job_id] = {"status": "rendering", "message": "Creating video clips"}
         clip_files = []
         for i in range(3):
             out = f"{job_path}/c_{i}.mp4"
@@ -140,9 +169,11 @@ async def render_scene_v3_subtitles(payload: dict):
             except subprocess.CalledProcessError as e:
                 logger.error(f"Job {job_id}: FFmpeg failed for clip {i+1} - {str(e)}")
                 logger.error(f"Job {job_id}: FFmpeg stderr: {e.stderr}")
-                raise HTTPException(status_code=500, detail=f"Video rendering failed for clip {i+1}")
+                job_status[job_id] = {"status": "failed", "message": f"Video rendering failed for clip {i+1}"}
+                return
 
         # Merge clips
+        job_status[job_id] = {"status": "merging", "message": "Merging video clips"}
         merged = f"{job_path}/merged.mp4"
         logger.info(f"Job {job_id}: Merging {len(clip_files)} clips")
         
@@ -158,9 +189,11 @@ async def render_scene_v3_subtitles(payload: dict):
             logger.info(f"Job {job_id}: Clips merged successfully")
         except subprocess.CalledProcessError as e:
             logger.error(f"Job {job_id}: Failed to merge clips - {str(e)}")
-            raise HTTPException(status_code=500, detail="Failed to merge video clips")
+            job_status[job_id] = {"status": "failed", "message": "Failed to merge video clips"}
+            return
 
         # Add audio and create final output
+        job_status[job_id] = {"status": "finalizing", "message": "Adding audio tracks"}
         final = f"{job_path}/final.mp4"
         logger.info(f"Job {job_id}: Adding audio tracks")
         
@@ -180,19 +213,18 @@ async def render_scene_v3_subtitles(payload: dict):
                 ], check=True, capture_output=True, text=True)
             
             logger.info(f"Job {job_id}: Render completed successfully")
-            return FileResponse(final, media_type="video/mp4")
+            job_status[job_id] = {
+                "status": "completed", 
+                "message": "Render completed successfully",
+                "result_file": final
+            }
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Job {job_id}: Failed to add audio - {str(e)}")
-            raise HTTPException(status_code=500, detail="Failed to add audio to video")
-    except HTTPException:
-        # Re-raise HTTP exceptions (these have proper error messages)
-        raise
+            job_status[job_id] = {"status": "failed", "message": "Failed to add audio to video"}
     except Exception as e:
         logger.error(f"Job {job_id}: Unexpected error - {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-    finally:
-        # Cleanup job directory after a delay (to allow file response to complete)
+        job_status[job_id] = {"status": "failed", "message": f"Internal error: {str(e)}"}
         logger.info(f"Job {job_id}: Cleaning up temporary files")
 
 @app.post("/concat")
@@ -283,7 +315,25 @@ def cleanup_system(max_age_hours: int = 1):
 
 @app.get("/job_status/{job_id}")
 def get_job_status(job_id: str):
-    """Check if a job is completed by looking for the final.mp4 file"""
+    """Check job status using both memory tracking and file system"""
+    # Check memory status first
+    if job_id in job_status:
+        status_info = job_status[job_id].copy()
+        status_info["job_id"] = job_id
+        
+        # If marked as completed, verify file exists
+        if status_info["status"] == "completed":
+            final_path = os.path.join(TEMP_DIR, job_id, "final.mp4")
+            if os.path.exists(final_path):
+                status_info["file_size_bytes"] = os.path.getsize(final_path)
+                status_info["download_url"] = f"/download/{job_id}"
+            else:
+                status_info["status"] = "processing"
+                status_info["message"] = "Finalizing render"
+        
+        return status_info
+    
+    # Fallback to file system check
     job_path = os.path.join(TEMP_DIR, job_id)
     final_path = os.path.join(job_path, "final.mp4")
     
@@ -304,28 +354,10 @@ def get_job_status(job_id: str):
             "download_url": f"/download/{job_id}"
         }
     else:
-        # Check for any ongoing ffmpeg processes or if intermediate files exist
-        has_clips = any(os.path.exists(os.path.join(job_path, f"c_{i}.mp4")) for i in range(3))
-        has_merged = os.path.exists(os.path.join(job_path, "merged.mp4"))
-        has_audio = os.path.exists(os.path.join(job_path, "voice.mp3"))
-        
-        if has_merged:
-            status = "finalizing"
-            message = "Adding audio tracks"
-        elif has_clips:
-            status = "merging" 
-            message = "Merging video clips"
-        elif has_audio:
-            status = "rendering"
-            message = "Rendering video clips"
-        else:
-            status = "processing"
-            message = "Downloading assets and preparing"
-            
         return {
             "job_id": job_id,
-            "status": status,
-            "message": message
+            "status": "processing",
+            "message": "Render in progress"
         }
 
 @app.get("/download/{job_id}")
