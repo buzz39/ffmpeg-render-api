@@ -1,10 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
-import subprocess, requests, os, uuid, shutil, json, time, textwrap, logging, threading
-from typing import Optional, List, Dict
-from enum import Enum
-from dataclasses import dataclass, asdict
-from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+import subprocess, requests, os, uuid, shutil, json, time, textwrap, logging
+from typing import Optional, List
 
 # Configure logging
 logging.basicConfig(
@@ -12,31 +9,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-class JobStatus(Enum):
-    PENDING = "pending"
-    DOWNLOADING = "downloading"
-    RENDERING = "rendering"
-    MERGING = "merging"
-    FINALIZING = "finalizing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-@dataclass
-class JobInfo:
-    job_id: str
-    status: JobStatus
-    progress: int  # 0-100
-    message: str
-    created_at: datetime
-    updated_at: datetime
-    result_file: Optional[str] = None
-    error: Optional[str] = None
-    estimated_completion: Optional[datetime] = None
-
-# Global job tracking
-jobs: Dict[str, JobInfo] = {}
-jobs_lock = threading.Lock()
 
 app = FastAPI()
 
@@ -48,38 +20,10 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Run 'ls /usr/share/fonts/truetype/noto/' to check.
 FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"
 
-def update_job_status(job_id: str, status: JobStatus, progress: int = 0, message: str = "", error: str = None, result_file: str = None):
-    """Thread-safe job status update"""
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].status = status
-            jobs[job_id].progress = progress
-            jobs[job_id].message = message
-            jobs[job_id].updated_at = datetime.now()
-            if error:
-                jobs[job_id].error = error
-            if result_file:
-                jobs[job_id].result_file = result_file
-            logger.info(f"Job {job_id}: {status.value} - {progress}% - {message}")
-
-def get_job_status(job_id: str) -> Optional[JobInfo]:
-    """Get current job status"""
-    with jobs_lock:
-        return jobs.get(job_id)
-
-def create_job(job_id: str) -> JobInfo:
-    """Create new job entry"""
-    job_info = JobInfo(
-        job_id=job_id,
-        status=JobStatus.PENDING,
-        progress=0,
-        message="Job created",
-        created_at=datetime.now(),
-        updated_at=datetime.now()
-    )
-    with jobs_lock:
-        jobs[job_id] = job_info
-    return job_info
+# Simple concurrent job limiting for 3-core server
+import threading
+render_lock = threading.Lock()
+MAX_CONCURRENT_RENDERS = 1  # Only 1 render at a time on 3-core server
 
 def download_asset(url: str, path: str, label: str) -> bool:
     if not url or str(url).lower() in ["none", "undefined", "null", ""]:
@@ -104,39 +48,30 @@ def download_asset(url: str, path: str, label: str) -> bool:
         return False
 
 @app.post("/render_scene_v3_subtitles")
-async def render_scene_v3_subtitles(payload: dict, background_tasks: BackgroundTasks):
-    """Start async video rendering job and return immediately with job ID"""
+async def render_scene_v3_subtitles(payload: dict):
+    # Check if server is already busy (protect 3-core server)
+    if not render_lock.acquire(blocking=False):
+        logger.warning("Render request rejected - server busy with another render job")
+        raise HTTPException(status_code=503, detail="Server is currently processing another render job. Please try again in a few minutes.")
+    
     job_id = str(uuid.uuid4())
-    create_job(job_id)
-    
-    # Input validation
-    if not payload.get("audio_url"):
-        update_job_status(job_id, JobStatus.FAILED, 0, "Missing audio_url", "audio_url is required")
-        raise HTTPException(status_code=400, detail="audio_url is required")
-    
-    if not payload.get("image_urls") or not isinstance(payload.get("image_urls"), list):
-        update_job_status(job_id, JobStatus.FAILED, 0, "Missing image_urls", "image_urls must be a non-empty list")
-        raise HTTPException(status_code=400, detail="image_urls must be a non-empty list")
-    
-    # Start background processing
-    background_tasks.add_task(process_render_job, job_id, payload)
-    
-    return JSONResponse({
-        "job_id": job_id,
-        "status": "pending",
-        "message": "Render job started",
-        "status_url": f"/job_status/{job_id}",
-        "download_url": f"/download/{job_id}"
-    })
-
-def process_render_job(job_id: str, payload: dict):
-    """Background task for processing video render job"""
     job_path = f"{TEMP_DIR}/{job_id}"
     os.makedirs(job_path, exist_ok=True)
     
     try:
-        update_job_status(job_id, JobStatus.DOWNLOADING, 5, "Starting downloads")
+        logger.info(f"Starting render job {job_id}")
+        logger.debug(f"Payload keys: {list(payload.keys())}")
         
+        # Input validation
+        if not payload.get("audio_url"):
+            logger.error(f"Job {job_id}: Missing audio_url")
+            raise HTTPException(status_code=400, detail="audio_url is required")
+        
+        if not payload.get("image_urls") or not isinstance(payload.get("image_urls"), list):
+            logger.error(f"Job {job_id}: Missing or invalid image_urls")
+            raise HTTPException(status_code=400, detail="image_urls must be a non-empty list")
+    
+    try:
         scene = str(payload.get("scene", "1"))
         image_urls = payload.get("image_urls", [])
         audio_url = payload.get("audio_url")
@@ -144,16 +79,13 @@ def process_render_job(job_id: str, payload: dict):
         bgm_url = payload.get("bgm_url")
         
         logger.info(f"Job {job_id}: Processing scene {scene} with {len(image_urls)} images")
-    
+
         # Download audio
-        update_job_status(job_id, JobStatus.DOWNLOADING, 10, "Downloading audio")
         audio_local = f"{job_path}/voice.mp3"
         if not download_asset(audio_url, audio_local, "Audio"):
-            update_job_status(job_id, JobStatus.FAILED, 10, "Failed to download audio", "Failed to download audio file")
-            return
+            raise HTTPException(status_code=400, detail="Failed to download audio file")
 
         # Get audio duration
-        update_job_status(job_id, JobStatus.DOWNLOADING, 15, "Analyzing audio duration")
         try:
             duration_result = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_local], 
@@ -162,24 +94,20 @@ def process_render_job(job_id: str, payload: dict):
             duration = float(duration_result.stdout.strip())
             logger.info(f"Job {job_id}: Audio duration: {duration:.2f} seconds")
         except (subprocess.CalledProcessError, ValueError) as e:
-            update_job_status(job_id, JobStatus.FAILED, 15, "Invalid audio file", str(e))
-            return
+            logger.error(f"Job {job_id}: Failed to get audio duration - {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid audio file or ffprobe error")
         
         # Download and validate images
-        update_job_status(job_id, JobStatus.DOWNLOADING, 20, "Downloading images")
         valid_images = []
         for i, url in enumerate(image_urls):
             path = f"{job_path}/img_{i}.png"
-            progress = 20 + (i + 1) * 10  # 20-50% for image downloads
-            update_job_status(job_id, JobStatus.DOWNLOADING, progress, f"Downloading image {i+1}/{len(image_urls)}")
             if download_asset(url, path, f"Img_{i}"):
                 valid_images.append(path)
         
         logger.info(f"Job {job_id}: Successfully downloaded {len(valid_images)} out of {len(image_urls)} images")
 
         if not valid_images:
-            update_job_status(job_id, JobStatus.FAILED, 50, "No valid images", "No valid images could be downloaded")
-            return
+            raise HTTPException(status_code=400, detail="No valid images could be downloaded")
         
         # Duplicate images if we have fewer than 3
         while len(valid_images) < 3:
@@ -187,7 +115,6 @@ def process_render_job(job_id: str, payload: dict):
             
         logger.info(f"Job {job_id}: Using {len(valid_images)} images for rendering")
 
-        update_job_status(job_id, JobStatus.RENDERING, 55, "Preparing render settings")
         time_per_shot = duration / 3
         wrapped_sub = "\n".join(textwrap.wrap(subtitle_text, width=38))
         clean_sub = wrapped_sub.replace("'", "").replace('"', '').replace(":", "")
@@ -198,41 +125,37 @@ def process_render_job(job_id: str, payload: dict):
         if not font_available:
             logger.warning(f"Job {job_id}: Font not found, subtitles will be disabled")
 
-        # Create individual clips with original high-quality settings
+        # Create individual clips
         clip_files = []
         for i in range(3):
-            progress = 60 + (i * 10)  # 60-90% for clip rendering
-            update_job_status(job_id, JobStatus.RENDERING, progress, f"Rendering clip {i+1}/3")
-            
             out = f"{job_path}/c_{i}.mp4"
             z = ["0.0005", "-0.0003", "0.0007"][i]
-            fr = int(time_per_shot * 30)  # Restored to 30fps for quality
+            fr = int(time_per_shot * 30)
             
             if font_available and clean_sub.strip():
                 drawtext = f",drawtext=text='{clean_sub}':fontfile={FONT_PATH}:fontcolor=white:fontsize=40:box=1:boxcolor=black@0.5:boxborderw=20:line_spacing=15:x=(w-text_w)/2:y=h-160"
             else:
                 drawtext = ""
-            
-            # Restored original high-quality filters: 4K scale, 30fps, unsharp filter
+                
             filters = f"scale=4000:-1,setsar=1/1,zoompan=z='1+{z}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={fr}:s=1280x720:fps=30,scale=1280:720{drawtext},unsharp=3:3:1.5"
             
             logger.info(f"Job {job_id}: Rendering clip {i+1}/3 (duration: {time_per_shot:.2f}s)")
             try:
-                # Restored original high-quality settings: CRF 18, default preset
+                # Optimized for 3-core CPU: use 2 threads to leave 1 core free for system
                 subprocess.run([
                     "ffmpeg", "-y", "-loop", "1", "-i", valid_images[i], 
                     "-filter_complex", filters, "-t", str(time_per_shot), 
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out
+                    "-c:v", "libx264", "-threads", "2", "-preset", "medium", 
+                    "-pix_fmt", "yuv420p", "-crf", "20", "-maxrate", "5M", "-bufsize", "10M", out
                 ], check=True, capture_output=True, text=True)
                 clip_files.append(out)
                 logger.info(f"Job {job_id}: Clip {i+1}/3 completed")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Job {job_id}: FFmpeg failed for clip {i+1} - {str(e)}")
-                update_job_status(job_id, JobStatus.FAILED, progress, f"Render failed on clip {i+1}", str(e))
-                return
+                logger.error(f"Job {job_id}: FFmpeg stderr: {e.stderr}")
+                raise HTTPException(status_code=500, detail=f"Video rendering failed for clip {i+1}")
 
         # Merge clips
-        update_job_status(job_id, JobStatus.MERGING, 90, "Merging video clips")
         merged = f"{job_path}/merged.mp4"
         logger.info(f"Job {job_id}: Merging {len(clip_files)} clips")
         
@@ -248,140 +171,76 @@ def process_render_job(job_id: str, payload: dict):
             logger.info(f"Job {job_id}: Clips merged successfully")
         except subprocess.CalledProcessError as e:
             logger.error(f"Job {job_id}: Failed to merge clips - {str(e)}")
-            update_job_status(job_id, JobStatus.FAILED, 90, "Merge failed", str(e))
-            return
+            raise HTTPException(status_code=500, detail="Failed to merge video clips")
 
         # Add audio and create final output
-        update_job_status(job_id, JobStatus.FINALIZING, 95, "Adding audio tracks")
         final = f"{job_path}/final.mp4"
         logger.info(f"Job {job_id}: Adding audio tracks")
         
         try:
+            # Optimized audio mixing for 3-core server
             if download_asset(bgm_url, f"{job_path}/bgm.mp3", "BGM"):
                 logger.info(f"Job {job_id}: Adding background music")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", merged, "-i", audio_local, "-i", f"{job_path}/bgm.mp3", 
                     "-filter_complex", "[1:a]volume=1.3[v]; [2:a]volume=0.08[bg]; [v][bg]amix=inputs=2:duration=first", 
-                    "-c:v", "copy", "-c:a", "aac", "-shortest", final
+                    "-c:v", "copy", "-c:a", "aac", "-threads", "2", "-shortest", final
                 ], check=True, capture_output=True, text=True)
             else:
                 logger.info(f"Job {job_id}: Adding voice audio only")
                 subprocess.run([
                     "ffmpeg", "-y", "-i", merged, "-i", audio_local, 
-                    "-c:v", "copy", "-c:a", "aac", "-shortest", final
+                    "-c:v", "copy", "-c:a", "aac", "-threads", "2", "-shortest", final
                 ], check=True, capture_output=True, text=True)
             
+            # Clean up intermediate files to save disk space
+            try:
+                for clip_file in clip_files:
+                    if os.path.exists(clip_file):
+                        os.remove(clip_file)
+                if os.path.exists(merged):
+                    os.remove(merged)
+                logger.info(f"Job {job_id}: Cleaned up intermediate files")
+            except Exception as cleanup_error:
+                logger.warning(f"Job {job_id}: Cleanup warning - {str(cleanup_error)}")
+            
             logger.info(f"Job {job_id}: Render completed successfully")
-            update_job_status(job_id, JobStatus.COMPLETED, 100, "Render completed", result_file=final)
+            return FileResponse(final, media_type="video/mp4")
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Job {job_id}: Failed to add audio - {str(e)}")
-            update_job_status(job_id, JobStatus.FAILED, 95, "Audio processing failed", str(e))
-            return
+            raise HTTPException(status_code=500, detail="Failed to add audio to video")
+    except HTTPException:
+        # Re-raise HTTP exceptions (these have proper error messages)
+        raise
     except Exception as e:
         logger.error(f"Job {job_id}: Unexpected error - {str(e)}", exc_info=True)
-        update_job_status(job_id, JobStatus.FAILED, 0, "Unexpected error", str(e))
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
-        # Keep job info for a while but cleanup large files
-        logger.info(f"Job {job_id}: Processing completed")
-
-@app.get("/job_status/{job_id}")
-async def get_job_status_endpoint(job_id: str):
-    """Get status of a render job"""
-    job_info = get_job_status(job_id)
-    if not job_info:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    response = asdict(job_info)
-    # Convert datetime objects to ISO strings
-    response["created_at"] = job_info.created_at.isoformat()
-    response["updated_at"] = job_info.updated_at.isoformat()
-    response["status"] = job_info.status.value
-    
-    if job_info.estimated_completion:
-        response["estimated_completion"] = job_info.estimated_completion.isoformat()
-    
-    return response
-
-@app.get("/download/{job_id}")
-async def download_result(job_id: str):
-    """Download completed render result"""
-    job_info = get_job_status(job_id)
-    if not job_info:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    if job_info.status != JobStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail=f"Job not completed. Status: {job_info.status.value}")
-    
-    if not job_info.result_file or not os.path.exists(job_info.result_file):
-        raise HTTPException(status_code=404, detail="Result file not found")
-    
-    return FileResponse(job_info.result_file, media_type="video/mp4", filename=f"scene_{job_id}.mp4")
-
-@app.get("/jobs")
-async def list_jobs():
-    """List all jobs with their current status"""
-    with jobs_lock:
-        job_list = []
-        for job_id, job_info in jobs.items():
-            job_dict = {
-                "job_id": job_id,
-                "status": job_info.status.value,
-                "progress": job_info.progress,
-                "message": job_info.message,
-                "created_at": job_info.created_at.isoformat(),
-                "updated_at": job_info.updated_at.isoformat()
-            }
-            if job_info.error:
-                job_dict["error"] = job_info.error
-            job_list.append(job_dict)
-        
-        return {"jobs": job_list, "total": len(job_list)}
+        # Always release the render lock
+        render_lock.release()
+        # Cleanup job directory after a delay (to allow file response to complete)
+        logger.info(f"Job {job_id}: Cleaning up temporary files")
 
 @app.post("/concat")
-async def concat_videos(payload: dict, background_tasks: BackgroundTasks):
-    """Start async video concatenation job"""
+def concat_videos(payload: dict):
     job_id = str(uuid.uuid4())
-    create_job(job_id)
-    
-    videos = payload.get("videos", [])
-    if not videos:
-        update_job_status(job_id, JobStatus.FAILED, 0, "No videos provided", "videos list is required")
-        raise HTTPException(status_code=400, detail="videos list is required")
-    
-    background_tasks.add_task(process_concat_job, job_id, payload)
-    
-    return JSONResponse({
-        "job_id": job_id,
-        "status": "pending",
-        "message": f"Concat job started with {len(videos)} videos",
-        "status_url": f"/job_status/{job_id}",
-        "download_url": f"/download/{job_id}"
-    })
-
-def process_concat_job(job_id: str, payload: dict):
-    """Background task for processing video concatenation"""
     workdir = f"{TEMP_DIR}/{job_id}"
     os.makedirs(workdir, exist_ok=True)
     
+    logger.info(f"Concat job {job_id}: Starting with {len(payload.get('videos', []))} videos")
+    
     try:
-        update_job_status(job_id, JobStatus.DOWNLOADING, 10, "Starting video downloads")
-        
         videos = payload.get("videos", [])
         output_name = payload.get("output_name", "final_story.mp4")
         local_files = []
         
-        logger.info(f"Concat job {job_id}: Starting with {len(videos)} videos")
-        
-        # Download videos with progress tracking
+        # 1. Download only VALID URLs
         for i, url in enumerate(videos):
             if not url or "http" not in str(url):
                 logger.warning(f"Concat job {job_id}: Skipping empty video URL at index {i}")
                 continue
-            
-            progress = 10 + (i + 1) * 60 // len(videos)  # 10-70% for downloads
-            update_job_status(job_id, JobStatus.DOWNLOADING, progress, f"Downloading video {i+1}/{len(videos)}")
-            
+                
             path = f"{workdir}/s_{i}.mp4"
             try:
                 logger.info(f"Concat job {job_id}: Downloading video {i+1}/{len(videos)}")
@@ -398,19 +257,17 @@ def process_concat_job(job_id: str, payload: dict):
 
         if not local_files:
             logger.error(f"Concat job {job_id}: No valid scene videos found to join")
-            update_job_status(job_id, JobStatus.FAILED, 70, "No valid videos", "No valid scene videos found to join")
-            return
+            raise HTTPException(status_code=400, detail="No valid scene videos found to join.")
         
-        update_job_status(job_id, JobStatus.MERGING, 80, f"Concatenating {len(local_files)} videos")
         logger.info(f"Concat job {job_id}: Concatenating {len(local_files)} valid videos")
 
-        # Create the FFmpeg instructions file
+        # 2. Create the FFmpeg instructions file
         list_file = f"{workdir}/list.txt"
         with open(list_file, "w") as f:
             for p in local_files:
                 f.write(f"file '{os.path.abspath(p)}'\n")
 
-        # Stitch them together
+        # 3. Stitch them together (No re-encoding = Instant)
         output_path = f"{workdir}/{output_name}"
         try:
             logger.info(f"Concat job {job_id}: Running ffmpeg concat")
@@ -419,77 +276,169 @@ def process_concat_job(job_id: str, payload: dict):
                 "-i", list_file, "-c", "copy", output_path
             ], check=True, capture_output=True, text=True)
             logger.info(f"Concat job {job_id}: Successfully created {output_name}")
-            update_job_status(job_id, JobStatus.COMPLETED, 100, "Concatenation completed", result_file=output_path)
         except subprocess.CalledProcessError as e:
             logger.error(f"Concat job {job_id}: FFmpeg concat failed - {str(e)}")
-            update_job_status(job_id, JobStatus.FAILED, 80, "FFmpeg concat failed", str(e))
-            return
+            raise HTTPException(status_code=500, detail="Failed to concatenate videos")
 
+        return FileResponse(output_path, media_type="video/mp4", filename=output_name)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Concat job {job_id}: Unexpected error - {str(e)}", exc_info=True)
-        update_job_status(job_id, JobStatus.FAILED, 0, "Unexpected error", str(e))
+        raise HTTPException(status_code=500, detail=f"Concat failed: {str(e)}")
 
 # =====================================================
-# THE ENHANCED CLEANUP SYSTEM
+# THE MISSING CLEANUP ROUTE
 # =====================================================
 @app.get("/cleanup")
-def cleanup_system(max_age_hours: int = 1, clean_completed_jobs: bool = True):
-    """Enhanced cleanup with job tracking"""
+def cleanup_system(max_age_hours: int = 1):
     logger.info(f"Starting cleanup of files older than {max_age_hours} hours")
     now = time.time()
     count = 0
-    cleaned_jobs = 0
-    
     try:
-        # Cleanup old job directories
         for folder in os.listdir(TEMP_DIR):
             path = os.path.join(TEMP_DIR, folder)
             if os.path.isdir(path) and os.stat(path).st_mtime < now - (max_age_hours * 3600):
                 shutil.rmtree(path, ignore_errors=True)
                 count += 1
-        
-        # Cleanup completed jobs from memory (optional)
-        if clean_completed_jobs:
-            with jobs_lock:
-                completed_jobs = [job_id for job_id, job_info in jobs.items() 
-                                if job_info.status in [JobStatus.COMPLETED, JobStatus.FAILED] 
-                                and (datetime.now() - job_info.updated_at).total_seconds() > (max_age_hours * 3600)]
-                
-                for job_id in completed_jobs:
-                    del jobs[job_id]
-                    cleaned_jobs += 1
-        
-        logger.info(f"Cleanup completed: removed {count} old folders, {cleaned_jobs} old job records")
-        return {
-            "status": "success", 
-            "folders_cleared": count,
-            "jobs_cleared": cleaned_jobs,
-            "active_jobs": len(jobs)
-        }
+        logger.info(f"Cleanup completed: removed {count} old job folders")
+        return {"status": "success", "cleared": count}
     except Exception as e:
         logger.error(f"Cleanup failed: {str(e)}")
-        return {"status": "error", "error": str(e), "cleared": count, "jobs_cleared": cleaned_jobs}
+        return {"status": "error", "error": str(e), "cleared": count}
+
+@app.get("/job_status/{job_id}")
+def get_job_status(job_id: str):
+    """Check if a job is completed by looking for the final.mp4 file"""
+    job_path = os.path.join(TEMP_DIR, job_id)
+    final_path = os.path.join(job_path, "final.mp4")
+    
+    if not os.path.exists(job_path):
+        return {
+            "job_id": job_id,
+            "status": "not_found",
+            "message": "Job not found"
+        }
+    
+    if os.path.exists(final_path):
+        file_size = os.path.getsize(final_path)
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "message": "Render completed successfully",
+            "file_size_bytes": file_size,
+            "download_url": f"/download/{job_id}"
+        }
+    else:
+        # Check for any ongoing ffmpeg processes or if intermediate files exist
+        has_clips = any(os.path.exists(os.path.join(job_path, f"c_{i}.mp4")) for i in range(3))
+        has_merged = os.path.exists(os.path.join(job_path, "merged.mp4"))
+        has_audio = os.path.exists(os.path.join(job_path, "voice.mp3"))
+        
+        if has_merged:
+            status = "finalizing"
+            message = "Adding audio tracks"
+        elif has_clips:
+            status = "merging" 
+            message = "Merging video clips"
+        elif has_audio:
+            status = "rendering"
+            message = "Rendering video clips"
+        else:
+            status = "processing"
+            message = "Downloading assets and preparing"
+            
+        return {
+            "job_id": job_id,
+            "status": status,
+            "message": message
+        }
+
+@app.get("/download/{job_id}")
+def download_job_result(job_id: str):
+    """Download the completed render result"""
+    final_path = os.path.join(TEMP_DIR, job_id, "final.mp4")
+    
+    if not os.path.exists(final_path):
+        raise HTTPException(status_code=404, detail="Render not completed or file not found")
+    
+    return FileResponse(
+        final_path, 
+        media_type="video/mp4", 
+        filename=f"scene_{job_id}.mp4"
+    )
+
+@app.get("/check_file/{filename}")
+def check_file_exists(filename: str):
+    """Simple endpoint to check if a rendered file exists"""
+    # Look for the file in any job directory
+    for job_dir in os.listdir(TEMP_DIR):
+        job_path = os.path.join(TEMP_DIR, job_dir)
+        if os.path.isdir(job_path):
+            final_path = os.path.join(job_path, "final.mp4")
+            if os.path.exists(final_path):
+                return {
+                    "exists": True, 
+                    "download_url": f"/download_file/{job_dir}",
+                    "size": os.path.getsize(final_path)
+                }
+    return {"exists": False}
+
+@app.get("/download_file/{job_id}")
+def download_file(job_id: str):
+    """Download a completed render file"""
+    final_path = os.path.join(TEMP_DIR, job_id, "final.mp4")
+    if os.path.exists(final_path):
+        return FileResponse(final_path, media_type="video/mp4", filename=f"scene_{job_id}.mp4")
+    raise HTTPException(status_code=404, detail="File not found")
 
 # Health check and debug endpoints
 @app.get("/")
 def read_root():
-    return {
-        "status": "Render API is Online", 
-        "version": "2.0 - Async Processing",
-        "endpoints": {
-            "render": "POST /render_scene_v3_subtitles - Start async video render job",
-            "concat": "POST /concat - Start async video concatenation job", 
-            "job_status": "GET /job_status/{job_id} - Check job progress",
-            "download": "GET /download/{job_id} - Download completed result",
-            "jobs": "GET /jobs - List all jobs",
-            "health": "GET /health - System health check",
-            "cleanup": "GET /cleanup - Clean old files and jobs"
-        },
-        "usage": {
-            "workflow": "1. POST to render/concat → get job_id → 2. Poll job_status → 3. Download when completed",
-            "timeout_solution": "Jobs now run asynchronously with full quality maintained - no more timeouts!"
+    return {"status": "Render API is Online"}
+
+@app.get("/system_resources")
+def get_system_resources():
+    """Monitor system resources for the 3-core 8GB server"""
+    try:
+        import shutil
+        
+        # Check disk space
+        disk_usage = shutil.disk_usage(TEMP_DIR)
+        disk_free_gb = disk_usage.free / (1024**3)
+        disk_total_gb = disk_usage.total / (1024**3)
+        disk_used_percent = ((disk_usage.total - disk_usage.free) / disk_usage.total) * 100
+        
+        # Count active jobs
+        active_jobs = len([d for d in os.listdir(TEMP_DIR) if os.path.isdir(os.path.join(TEMP_DIR, d))])
+        
+        # Estimate memory usage (rough calculation)
+        temp_dir_size = sum(os.path.getsize(os.path.join(dirpath, filename))
+                           for dirpath, dirnames, filenames in os.walk(TEMP_DIR)
+                           for filename in filenames) / (1024**2)  # MB
+        
+        return {
+            "server_specs": {
+                "cpu_cores": 3,
+                "ram_gb": 8,
+                "disk_total_gb": round(disk_total_gb, 2)
+            },
+            "current_usage": {
+                "active_render_jobs": active_jobs,
+                "disk_free_gb": round(disk_free_gb, 2),
+                "disk_used_percent": round(disk_used_percent, 2),
+                "temp_files_mb": round(temp_dir_size, 2)
+            },
+            "recommendations": {
+                "max_concurrent_jobs": 1 if active_jobs == 0 else "1 job already running",
+                "disk_warning": "Low disk space" if disk_free_gb < 10 else "OK",
+                "suggested_cleanup": disk_used_percent > 80
+            }
         }
-    }
+        
+    except Exception as e:
+        return {"error": f"Could not get system resources: {str(e)}"}
 
 @app.get("/health")
 def health_check():
@@ -509,15 +458,8 @@ def health_check():
         # Check temp directory
         temp_writable = os.access(TEMP_DIR, os.W_OK)
         
-        # Count active jobs and job directories
-        active_job_dirs = len([d for d in os.listdir(TEMP_DIR) if os.path.isdir(os.path.join(TEMP_DIR, d))])
-        
-        # Job status summary
-        with jobs_lock:
-            total_jobs = len(jobs)
-            job_status_counts = {}
-            for status in JobStatus:
-                job_status_counts[status.value] = sum(1 for job in jobs.values() if job.status == status)
+        # Count active jobs
+        active_jobs = len([d for d in os.listdir(TEMP_DIR) if os.path.isdir(os.path.join(TEMP_DIR, d))])
         
         health_status = {
             "status": "healthy" if all([ffmpeg_available, ffprobe_available, temp_writable]) else "unhealthy",
@@ -527,9 +469,7 @@ def health_check():
             "font_path": FONT_PATH,
             "temp_directory_writable": temp_writable,
             "temp_directory": TEMP_DIR,
-            "active_job_directories": active_job_dirs,
-            "total_jobs_tracked": total_jobs,
-            "jobs_by_status": job_status_counts
+            "active_jobs": active_jobs
         }
         
         logger.info(f"Health check completed: {health_status['status']}")
