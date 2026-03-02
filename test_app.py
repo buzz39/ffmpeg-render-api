@@ -3,6 +3,7 @@ Tests to verify the /merge endpoint does NOT impact any existing endpoints.
 Every existing endpoint is exercised to confirm zero regressions.
 """
 import os
+import shutil
 import time
 import pytest
 from unittest.mock import patch, MagicMock
@@ -153,7 +154,6 @@ class TestJobStatusEndpoint:
         assert data["file_size_bytes"] == 1024
 
         # cleanup
-        import shutil
         shutil.rmtree(job_path, ignore_errors=True)
 
 
@@ -176,7 +176,6 @@ class TestDownloadEndpoint:
         assert r.headers["content-type"] == "video/mp4"
         assert len(r.content) == 2048
 
-        import shutil
         shutil.rmtree(job_path, ignore_errors=True)
 
 
