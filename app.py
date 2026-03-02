@@ -227,6 +227,78 @@ def process_render_job(job_id: str, payload: dict):
         job_status[job_id] = {"status": "failed", "message": f"Internal error: {str(e)}"}
         logger.info(f"Job {job_id}: Cleaning up temporary files")
 
+@app.post("/merge")
+async def merge_video_audio(payload: dict, background_tasks: BackgroundTasks):
+    video_url = payload.get("video_url")
+    audio_url = payload.get("audio_url")
+
+    if not video_url:
+        raise HTTPException(status_code=400, detail="video_url is required")
+    if not audio_url:
+        raise HTTPException(status_code=400, detail="audio_url is required")
+
+    if not str(video_url).startswith(("http://", "https://")) or not str(audio_url).startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid URL provided")
+
+    job_id = str(uuid.uuid4())
+    job_status[job_id] = {
+        "status": "processing",
+        "message": "Downloading assets",
+        "created_at": time.time()
+    }
+
+    background_tasks.add_task(process_merge_job, job_id, video_url, audio_url)
+
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Merge job started",
+        "check_status_url": f"/job_status/{job_id}",
+        "download_url": f"/download/{job_id}"
+    }, status_code=202)
+
+
+def process_merge_job(job_id: str, video_url: str, audio_url: str):
+    job_path = f"{TEMP_DIR}/{job_id}"
+    os.makedirs(job_path, exist_ok=True)
+
+    try:
+        video_local = f"{job_path}/video.mp4"
+        audio_local = f"{job_path}/audio.mp4"
+
+        if not download_asset(video_url, video_local, "Video"):
+            job_status[job_id] = {"status": "failed", "message": "Failed to download video"}
+            return
+        if not download_asset(audio_url, audio_local, "Audio"):
+            job_status[job_id] = {"status": "failed", "message": "Failed to download audio"}
+            return
+
+        job_status[job_id] = {"status": "merging", "message": "Merging video and audio"}
+        final = f"{job_path}/final.mp4"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_local,
+            "-i", audio_local,
+            "-c:v", "copy", "-c:a", "aac", "-shortest",
+            final
+        ], check=True, capture_output=True, text=True)
+
+        logger.info(f"Merge job {job_id}: Completed successfully")
+        job_status[job_id] = {
+            "status": "completed",
+            "message": "Merge completed successfully",
+            "result_file": final
+        }
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Merge job {job_id}: ffmpeg failed - {e.stderr}")
+        job_status[job_id] = {"status": "failed", "message": f"ffmpeg error: {e.stderr[:200]}"}
+    except Exception as e:
+        logger.error(f"Merge job {job_id}: Unexpected error - {str(e)}", exc_info=True)
+        job_status[job_id] = {"status": "failed", "message": f"Internal error: {str(e)}"}
+
+
 @app.post("/concat")
 def concat_videos(payload: dict):
     job_id = str(uuid.uuid4())
